@@ -30,6 +30,9 @@ inputs:
   assets:
     description: 'A JSON-encoded list of assets'
     default: '[]'
+  max_retries:
+    description: 'Max retries to upload release assets'
+    default: 2
 
 runs:
   using: 'docker'
@@ -49,4 +52,6 @@ runs:
   - ${{ inputs.body }}
   - "--assets"
   - ${{ inputs.assets }}
+  - "--max-retries"
+  - ${{ inputs.max_retries }}
   - "--draft=${{ inputs.draft }}"

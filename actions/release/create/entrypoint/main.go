@@ -6,11 +6,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 type Release struct {
@@ -23,12 +25,13 @@ type Release struct {
 
 func main() {
 	var config struct {
-		Endpoint string
-		Repo     string
-		Token    string
-		Release  Release
-		Draft    bool
-		Assets   string
+		Endpoint   string
+		Repo       string
+		Token      string
+		Release    Release
+		Draft      bool
+		Assets     string
+		MaxRetries int
 	}
 
 	flag.StringVar(&config.Endpoint, "endpoint", "https://api.github.com", "Specifies endpoint for sending requests")
@@ -40,6 +43,7 @@ func main() {
 	flag.StringVar(&config.Release.Body, "body", "", "Contents of release body")
 	flag.BoolVar(&config.Draft, "draft", false, "Sets the release as a draft")
 	flag.StringVar(&config.Assets, "assets", "", "JSON-encoded assets metadata")
+	flag.IntVar(&config.MaxRetries, "max-retries", 0, "Max retries to upload each asset")
 	flag.Parse()
 
 	if config.Repo == "" {
@@ -112,44 +116,19 @@ func main() {
 		fail(fmt.Errorf("failed to parse create release response: %w", err))
 	}
 
+	retries := 0
 	for _, asset := range assets {
-		uri, err := url.Parse(release.UploadURL)
-		if err != nil {
-			fail(fmt.Errorf("failed to parse upload url: %w", err))
-		}
-
-		uri.Path = fmt.Sprintf("/repos/%s/releases/%d/assets", config.Repo, release.ID)
-		uri.RawQuery = url.Values{"name": []string{asset.Name}}.Encode()
-
-		file, err := os.Open(asset.Path)
-		if err != nil {
-			fail(fmt.Errorf("failed to open file: %w", err))
-		}
-
-		info, err := file.Stat()
-		if err != nil {
-			fail(fmt.Errorf("failed to stat file: %w", err))
-		}
-
-		req, err = http.NewRequest("POST", uri.String(), file)
-		if err != nil {
-			fail(fmt.Errorf("failed to create request: %w", err))
-		}
-
-		req.Header.Set("Authorization", fmt.Sprintf("token %s", config.Token))
-
-		req.ContentLength = info.Size()
-		req.Header.Set("Content-Type", asset.ContentType)
-
-		fmt.Printf("  Uploading asset: %s -> %s\n", asset.Path, asset.Name)
-		resp, err = http.DefaultClient.Do(req)
-		if err != nil {
-			fail(fmt.Errorf("failed to complete request: %w", err))
-		}
-
-		if resp.StatusCode != http.StatusCreated {
-			dump, _ := httputil.DumpResponse(resp, true)
-			fail(fmt.Errorf("failed to upload asset: unexpected response: %s", dump))
+		for {
+			err := uploadAsset(release.ID, release.UploadURL, asset.Name, asset.Path, asset.ContentType, config.Repo, config.Token)
+			if err == nil {
+				break
+			} else if retries == config.MaxRetries {
+				fmt.Printf("Failed uploading asset after %d retries\n", retries)
+				fail(err)
+			}
+			retries++
+			fmt.Printf("Failed uploading asset. Retrying (retry #%d)\n", retries)
+			time.Sleep(time.Second * 60)
 		}
 	}
 
@@ -177,6 +156,62 @@ func main() {
 	}
 
 	fmt.Println("Release is published, exiting.")
+}
+
+// UploadAsset will upload the given asset to the given release of the given
+// repo using the given token.
+func uploadAsset(releaseId int, releaseUploadURL, assetName, assetPath, assetContentType, repo, token string) error {
+	uri, err := url.Parse(releaseUploadURL)
+	if err != nil {
+		return fmt.Errorf("failed to parse upload url: %w", err)
+	}
+
+	uri.Path = fmt.Sprintf("/repos/%s/releases/%d/assets", repo, releaseId)
+	uri.RawQuery = url.Values{"name": []string{assetName}}.Encode()
+
+	file, err := os.Open(assetPath)
+	if err != nil {
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", uri.String(), file)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("token %s", token))
+
+	req.ContentLength = info.Size()
+	req.Header.Set("Content-Type", assetContentType)
+	req.GetBody = func() (io.ReadCloser, error) {
+		return os.Open(assetPath)
+	}
+	// prevents re-use of TCP connections between requests
+	req.Close = true
+
+	fmt.Printf("  Uploading asset: %s -> %s\n", assetPath, assetName)
+	client := &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 20,
+		},
+		Timeout: 10 * time.Second,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to complete request: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusCreated {
+		dump, _ := httputil.DumpResponse(resp, true)
+		return fmt.Errorf("failed to upload asset: unexpected response: %s", dump)
+	}
+	return nil
 }
 
 func fail(err error) {

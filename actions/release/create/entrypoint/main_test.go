@@ -367,6 +367,134 @@ func TestEntrypoint(t *testing.T) {
 				Expect(buffer).To(gbytes.Say(fmt.Sprintf(`  Uploading asset: %s -> other-asset-name`, filepath.Join(tmpDir, "other-asset"))))
 				Expect(buffer).To(gbytes.Say(`Release is drafted, exiting.`))
 			})
+
+			context("when uploading asset fails once", func() {
+				var retrialApi *httptest.Server
+				var assetUploadTries int
+
+				it.Before(func() {
+					retrialApi = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+						dump, _ := httputil.DumpRequest(req, true)
+						receivedRequest, _ := http.ReadRequest(bufio.NewReader(bytes.NewBuffer(dump)))
+
+						requests = append(requests, receivedRequest)
+
+						switch req.URL.Path {
+						case "/repos/some-org/some-repo/releases":
+							w.WriteHeader(http.StatusCreated)
+							fmt.Fprintf(w, `{
+						"id": 1,
+						"upload_url": "%s/repos/some-org/some-repo/releases/1/assets{?name,label}"
+					}`, retrialApi.URL)
+
+						case "/repos/some-org/some-repo/releases/1/assets":
+							// Only succeed on third attempt
+							if assetUploadTries == 2 {
+								w.WriteHeader(http.StatusCreated)
+							} else {
+								w.WriteHeader(http.StatusInternalServerError)
+								assetUploadTries++
+							}
+
+						default:
+							t.Fatal(fmt.Sprintf("unknown request: %s", dump))
+						}
+					}))
+				})
+
+				it("retries and creates a release", func() {
+					command := exec.Command(
+						entrypoint,
+						"--max-retries", "2",
+						"--endpoint", retrialApi.URL,
+						"--repo", "some-org/some-repo",
+						"--token", "some-github-token",
+						"--tag-name", "some-tag",
+						"--target-commitish", "some-commitish",
+						"--name", "some-name",
+						"--body", "some-body",
+						"--draft",
+						"--assets", fmt.Sprintf(`[
+						{
+						  "path": "%s",
+							"name": "some-asset-name",
+							"content_type": "some-content-type"
+						}
+					]`, filepath.Join(tmpDir, "some-asset")),
+					)
+
+					buffer := gbytes.NewBuffer()
+
+					session, err := gexec.Start(command, buffer, buffer)
+					Expect(err).NotTo(HaveOccurred())
+
+					Eventually(session).Should(gexec.Exit(0), func() string { return fmt.Sprintf("output -> \n%s\n", buffer.Contents()) })
+
+					Expect(requests).To(HaveLen(4))
+
+					Expect(requests[2].Method).To(Equal("POST"))
+					Expect(requests[2].URL.Path).To(Equal("/repos/some-org/some-repo/releases/1/assets"))
+					Expect(requests[2].URL.Query().Get("name")).To(Equal("some-asset-name"))
+
+					Expect(requests[2].Header.Get("Content-Type")).To(Equal("some-content-type"))
+					Expect(requests[2].ContentLength).To(Equal(int64(13)))
+
+					content, err := ioutil.ReadAll(requests[2].Body)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(string(content)).To(Equal("some-contents"))
+
+					Expect(requests[3].Method).To(Equal("POST"))
+					Expect(requests[3].URL.Path).To(Equal("/repos/some-org/some-repo/releases/1/assets"))
+					Expect(requests[3].URL.Query().Get("name")).To(Equal("some-asset-name"))
+
+					Expect(requests[3].Header.Get("Content-Type")).To(Equal("some-content-type"))
+					Expect(requests[3].ContentLength).To(Equal(int64(13)))
+
+					content, err = ioutil.ReadAll(requests[3].Body)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(string(content)).To(Equal("some-contents"))
+
+					Expect(buffer).To(gbytes.Say(`Creating release`))
+					Expect(buffer).To(gbytes.Say(`  Repository: some-org/some-repo`))
+					Expect(buffer).To(gbytes.Say(fmt.Sprintf(`  Uploading asset: %s -> some-asset-name`, filepath.Join(tmpDir, "some-asset"))))
+					Expect(buffer).To(gbytes.Say(fmt.Sprintf(`  Uploading asset: %s -> some-asset-name`, filepath.Join(tmpDir, "some-asset"))))
+					Expect(buffer).To(gbytes.Say(fmt.Sprintf(`  Uploading asset: %s -> some-asset-name`, filepath.Join(tmpDir, "some-asset"))))
+					Expect(buffer).To(gbytes.Say(`Release is drafted, exiting.`))
+				})
+
+				context("all asset upload retries fail", func() {
+					it("prints an error and exits non-zero", func() {
+						command := exec.Command(
+							entrypoint,
+							"--max-retries", "1",
+							"--endpoint", retrialApi.URL,
+							"--repo", "some-org/some-repo",
+							"--token", "some-github-token",
+							"--tag-name", "some-tag",
+							"--target-commitish", "some-commitish",
+							"--name", "some-name",
+							"--body", "some-body",
+							"--draft",
+							"--assets", fmt.Sprintf(`[
+						{
+						  "path": "%s",
+							"name": "some-asset-name",
+							"content_type": "some-content-type"
+						}
+					]`, filepath.Join(tmpDir, "some-asset")),
+						)
+
+						buffer := gbytes.NewBuffer()
+
+						session, err := gexec.Start(command, buffer, buffer)
+						Expect(err).NotTo(HaveOccurred())
+
+						Eventually(session).Should(gexec.Exit(1), func() string { return fmt.Sprintf("output -> \n%s\n", buffer.Contents()) })
+
+						Expect(buffer).To(gbytes.Say(`Failed uploading asset after 1 retries`))
+					})
+				})
+			})
 		})
 
 		context("failure cases", func() {
