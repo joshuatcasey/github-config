@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 type Release struct {
@@ -142,7 +143,17 @@ func main() {
 		req.Header.Set("Content-Type", asset.ContentType)
 
 		fmt.Printf("  Uploading asset: %s -> %s\n", asset.Path, asset.Name)
-		resp, err = http.DefaultClient.Do(req)
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.MaxIdleConns = 100
+		t.MaxConnsPerHost = 100
+		t.MaxIdleConnsPerHost = 100
+
+		httpClient := &http.Client{
+			Timeout:   time.Second * 10,
+			Transport: t,
+		}
+
+		resp, err = httpClient.Do(req)
 		if err != nil {
 			fail(fmt.Errorf("failed to complete request: %w", err))
 		}
